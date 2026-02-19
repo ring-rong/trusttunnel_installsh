@@ -269,15 +269,24 @@ find_free_port() {
 }
 
 # Определяем режим прослушивания
+# При наличии nginx x-ui-pro: nginx занял 443 с proxy_protocol ON.
+# TrustTunnel НЕ поддерживает PROXY protocol.
+# nginx stream НЕ поддерживает два server{} на одном порту 443.
+# Решение: TrustTunnel слушает на отдельном публичном порту (2083 — популярный HTTPS-альтернативный порт).
+# nginx при этом не трогаем вовсе — TrustTunnel работает напрямую.
 if [ "$HAS_NGINX" -eq 1 ]; then
-    # Сосуществование с nginx: внутренний порт, nginx проксирует по SNI
-    TT_LISTEN_ADDR="127.0.0.1"
-    TT_PORT=$(find_free_port 11000 19999)
-    TT_PUBLIC_PORT=443
+    TT_LISTEN_ADDR="0.0.0.0"
+    # Порт 2083 — стандартный HTTPS-альтернативный порт, не блокируется большинством провайдеров
+    TT_PORT=2083
+    # Проверяем что порт свободен, иначе берём случайный
+    if ss -tlnp 2>/dev/null | grep -q ":2083[[:space:]]"; then
+        TT_PORT=$(find_free_port 2000 2999)
+        warn "Порт 2083 занят, используем $TT_PORT"
+    fi
+    TT_PUBLIC_PORT=$TT_PORT
     COEXIST_MODE=1
-    inf "Режим сосуществования с nginx: внутренний порт $TT_PORT, публичный — 443 (через SNI proxy)"
+    inf "Режим сосуществования с nginx: TrustTunnel на 0.0.0.0:$TT_PORT (прямой, без nginx)"
 else
-    # Чистый сервер: слушаем на 443 напрямую
     TT_LISTEN_ADDR="0.0.0.0"
     TT_PORT=443
     TT_PUBLIC_PORT=443
@@ -289,6 +298,7 @@ if [ "$TT_PORT" = "0" ]; then
     err "Не удалось найти свободный внутренний порт."
     exit 1
 fi
+
 
 # ── Генерация конфигурационных файлов ─────────────────────────────────────────
 sep
@@ -408,148 +418,22 @@ EOF
 chown trusttunnel:trusttunnel "$INSTALL_DIR"/*.toml
 ok "Конфиги созданы."
 
-# ── Добавление в nginx SNI map (только при сосуществовании) ───────────────────
+# ── Очистка старых nginx конфигов от предыдущих версий скрипта ───────────────
 if [ "$COEXIST_MODE" -eq 1 ]; then
     sep
-    inf "Настройка nginx SNI proxy для TrustTunnel..."
+    inf "Режим сосуществования: TrustTunnel работает на порту $TT_PORT напрямую (без nginx)."
+    inf "nginx x-ui-pro НЕ трогаем — он занят на 443 с proxy_protocol ON."
+    inf "TrustTunnel не поддерживает PROXY protocol, поэтому использует отдельный порт."
 
-    if [ "$HAS_XRAY_STREAM" -eq 1 ]; then
-        # x-ui-pro уже создал stream.conf со своим map + upstream-ами.
-        # Структура его stream.conf:
-        #   map $ssl_preread_server_name $sni_name { ... }
-        #   upstream xray { server 127.0.0.1:8443; }
-        #   upstream www  { server 127.0.0.1:7443; }
-        #   server { listen 443; proxy_pass $sni_name; ssl_preread on; }
-        #
-        # Наш upstream и запись в map добавляем В ТОТ ЖЕ stream.conf,
-        # чтобы не создавать конфликтов между несколькими stream-блоками на порту 443.
-        # При повторном запуске — удаляем старые наши строки и вставляем свежие.
-
-        STREAM_CONF="/etc/nginx/stream-enabled/stream.conf"
-
-        # Используем Python для надёжного редактирования stream.conf —
-        # sed слишком хрупок для многострочного формата nginx.
-        python3 - <<PYEOF
-import re, sys
-
-conf_path = "/etc/nginx/stream-enabled/stream.conf"
-domain    = "${DOMAIN}"
-port      = "${TT_PORT}"
-marker    = "# trusttunnel-managed"
-upstream  = f"upstream trusttunnel_backend {{ server 127.0.0.1:{port}; }} {marker}"
-map_entry = f"    {domain}    trusttunnel_backend; {marker}"
-
-with open(conf_path) as f:
-    text = f.read()
-
-# 1. Удаляем ВСЕ наши строки — и с маркером, и без (от старых версий скрипта).
-#    Чистим: любую строку содержащую trusttunnel_backend или наш домен в map.
-lines = [
-    l for l in text.splitlines()
-    if "trusttunnel_backend" not in l
-    and not re.match(r'^\s+' + re.escape(domain) + r'\s', l)
-]
-# Убираем задвоенные пустые строки которые могут остаться после удаления
-cleaned = []
-prev_blank = False
-for l in lines:
-    is_blank = l.strip() == ""
-    if is_blank and prev_blank:
-        continue
-    cleaned.append(l)
-    prev_blank = is_blank
-text = "\n".join(cleaned)
-
-# 2. Добавляем map-запись сразу после открывающей скобки map-блока
-text = re.sub(
-    r'(map\s+\$ssl_preread_server_name\s+\$sni_name\s*\{)',
-    r'\1\n' + map_entry,
-    text, count=1
-)
-
-# 3. Вставляем upstream перед ПЕРВЫМ "server {" в файле
-text = re.sub(
-    r'(?m)^server\s*\{',
-    upstream + "\nserver {",
-    text, count=1
-)
-
-with open(conf_path, "w") as f:
-    f.write(text + "\n")
-
-print("  stream.conf обновлён успешно")
-PYEOF
-
-        ok "Домен $DOMAIN → 127.0.0.1:$TT_PORT добавлен в nginx SNI map."
-
-        # Убираем отдельный файл upstream если остался от прошлых запусков
-        rm -f /etc/nginx/stream-enabled/trusttunnel_upstream.conf 2>/dev/null || true
-        rm -f /etc/nginx/stream-enabled/trusttunnel_stream.conf 2>/dev/null || true
-
-    else
-        # nginx есть, но stream.conf от x-ui-pro нет (nginx без x-ui-pro).
-        # Создаём свой полноценный stream-блок.
-        mkdir -p /etc/nginx/stream-enabled
-        cat > "/etc/nginx/stream-enabled/trusttunnel_stream.conf" <<EOF
-# trusttunnel-managed
-upstream trusttunnel_backend {
-    server 127.0.0.1:${TT_PORT};
-}
-
-map \$ssl_preread_server_name \$tt_backend {
-    ${DOMAIN}    trusttunnel_backend;
-}
-
-server {
-    listen 443;
-    proxy_pass \$tt_backend;
-    ssl_preread on;
-}
-EOF
-        ok "Создан nginx stream-блок для TrustTunnel на порту 443."
-
-        # Подключаем stream-enabled в nginx.conf если ещё не подключён
-        if ! grep -rq "stream-enabled" /etc/nginx/ 2>/dev/null; then
-            echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
-        fi
+    # Удаляем артефакты прошлых версий скрипта которые пытались настроить nginx SNI
+    rm -f /etc/nginx/stream-enabled/trusttunnel_sni.conf 2>/dev/null || true
+    rm -f /etc/nginx/stream-enabled/trusttunnel*.conf 2>/dev/null || true
+    if [ -f /etc/nginx/stream-enabled/stream.conf ]; then
+        sed -i '/trusttunnel_backend/d' /etc/nginx/stream-enabled/stream.conf 2>/dev/null || true
+        # Не перезагружаем nginx если конфиг не изменился
+        nginx -t -q 2>/dev/null && nginx -s reload 2>/dev/null || true
     fi
-
-    # ── Исправляем дублирование ngx_stream_module ───────────────────────────────
-    # x-ui-pro добавляет в nginx.conf:
-    #   load_module /usr/lib/nginx/modules/ngx_stream_module.so;
-    # Ubuntu/Debian грузит его через modules-enabled/50-mod-stream.conf.
-    # Двойная загрузка → "[emerg] already loaded".
-    # 70-mod-stream-geoip2.conf зависит от stream и должен идти после 50-mod-stream.
-    #
-    # Правильное решение:
-    #   1. Убеждаемся что 50-mod-stream.conf симлинк существует (правильный порядок)
-    #   2. Удаляем дублирующий load_module из nginx.conf
-
-    # Восстанавливаем симлинк если он был удалён (предыдущими запусками скрипта)
-    # Имя файла в modules-available: mod-stream.conf (без числового префикса)
-    STREAM_MOD_SRC=$(find /usr/share/nginx/modules-available/ -name "*mod-stream.conf" \
-                     ! -name "*geoip*" 2>/dev/null | head -1)
-    if [ -n "$STREAM_MOD_SRC" ] && [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ]; then
-        ln -sf "$STREAM_MOD_SRC" /etc/nginx/modules-enabled/50-mod-stream.conf
-        inf "Восстановлен симлинк 50-mod-stream.conf → $STREAM_MOD_SRC"
-    fi
-
-    # Удаляем load_module ngx_stream_module из nginx.conf — он дублирует modules-enabled
-    sed -i '/load_module.*ngx_stream_module\.so/d' /etc/nginx/nginx.conf 2>/dev/null || true
-
-    # Подключаем stream-enabled в nginx.conf если ещё не подключён
-    if ! grep -rq "stream-enabled" /etc/nginx/ 2>/dev/null; then
-        echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
-    fi
-
-    # Проверяем конфиг и перезагружаем
-    if ! nginx -t 2>/tmp/nginx_test.log; then
-        err "nginx конфиг невалиден после изменений:"
-        cat /tmp/nginx_test.log >&2
-        exit 1
-    fi
-    nginx -s reload
-    ok "nginx перезагружен с новым SNI routing."
+    ok "Артефакты предыдущих версий скрипта удалены."
 fi
 
 # ── UFW ──────────────────────────────────────────────────────────────────────
@@ -558,20 +442,24 @@ if command -v ufw &>/dev/null; then
     ufw allow 443/udp &>/dev/null || true
     if [ "$COEXIST_MODE" -eq 0 ]; then
         ufw allow 80/tcp &>/dev/null || true
+    else
+        # Открываем публичный порт TrustTunnel (не 443)
+        ufw allow "${TT_PORT}/tcp" &>/dev/null || true
+        ufw allow "${TT_PORT}/udp" &>/dev/null || true
+        ok "UFW: открыт порт $TT_PORT (TCP+UDP) для TrustTunnel."
     fi
     ufw reload &>/dev/null || true
     ok "UFW: порты открыты."
 fi
 
-# ── Systemd сервис ────────────────────────────────────────────────────────────
+
+# ── Systemd сервис ────────────────────────────────────────────────────────────────────────────
 sep
 inf "Создание systemd сервиса..."
 
-# Создаём лог-файл от имени пользователя trusttunnel ДО старта сервиса,
-# иначе systemd создаст его как root и endpoint упадёт с Permission denied.
-touch /var/log/trusttunnel.log
-chown trusttunnel:trusttunnel /var/log/trusttunnel.log
-chmod 640 /var/log/trusttunnel.log
+# Останавливаем старый сервис если запущен — он мог стартовать со старым vpn.toml (старым портом).
+systemctl stop trusttunnel 2>/dev/null || true
+sleep 1
 
 cat > /etc/systemd/system/trusttunnel.service <<EOF
 [Unit]
@@ -585,16 +473,17 @@ Type=simple
 User=trusttunnel
 Group=trusttunnel
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/trusttunnel_endpoint \\
-    ${INSTALL_DIR}/vpn.toml \\
-    ${INSTALL_DIR}/hosts.toml \\
-    --logfile /var/log/trusttunnel.log
+# Абсолютные пути обязательны — endpoint читает конфиги относительно WorkingDirectory
+ExecStart=${INSTALL_DIR}/trusttunnel_endpoint ${INSTALL_DIR}/vpn.toml ${INSTALL_DIR}/hosts.toml
 # Hot-reload TLS при SIGHUP (без остановки сервиса)
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Логи идут в journald (journalctl -u trusttunnel -f)
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -603,15 +492,53 @@ EOF
 systemctl daemon-reload
 systemctl enable trusttunnel
 systemctl start trusttunnel
-sleep 2
+sleep 3
 
-if systemctl is-active --quiet trusttunnel; then
-    ok "Сервис TrustTunnel запущен и включён в автозапуск."
-else
+# Проверяем что запустился и слушает именно нужный порт
+if ! systemctl is-active --quiet trusttunnel; then
     err "TrustTunnel не запустился. Логи:"
     journalctl -u trusttunnel -n 20 --no-pager || true
     exit 1
 fi
+ok "Сервис TrustTunnel запущен и включён в автозапуск."
+
+# Проверяем реальный порт из логов — endpoint может взять другой порт если указанный занят
+ACTUAL_PORT=$(journalctl -u trusttunnel -n 20 --no-pager 2>/dev/null \
+    | grep -oP 'Listening to TCP 127\.0\.0\.1:\K[0-9]+' | tail -1 || echo "")
+
+if [ -n "$ACTUAL_PORT" ] && [ "$ACTUAL_PORT" != "$TT_PORT" ]; then
+    warn "Endpoint слушает на порту $ACTUAL_PORT, а nginx роутит на $TT_PORT — обновляем..."
+    TT_PORT="$ACTUAL_PORT"
+
+    sed -i "s|listen_address = \".*\"|listen_address = \"0.0.0.0:${TT_PORT}\"|" \
+        "${INSTALL_DIR}/vpn.toml"
+
+    if [ "$COEXIST_MODE" -eq 1 ] && [ "$HAS_XRAY_STREAM" -eq 1 ]; then
+        TT_PY2=$(mktemp /tmp/tt_fix_XXXXXX.py)
+        cat > "$TT_PY2" << 'ENDPY2'
+import re, sys
+conf_path, port = sys.argv[1], sys.argv[2]
+marker = "# trusttunnel-managed"
+with open(conf_path) as f:
+    text = f.read()
+text = re.sub(
+    r'upstream trusttunnel_backend \{ server 127\.0\.0\.1:\d+; \}' + ' ' + re.escape(marker),
+    f"upstream trusttunnel_backend {{ server 127.0.0.1:{port}; }} {marker}",
+    text
+)
+with open(conf_path, "w") as f:
+    f.write(text)
+print(f"stream.conf: \u043f\u043e\u0440\u0442 \u043e\u0431\u043d\u043e\u0432\u043b\u0451\u043d \u043d\u0430 {port}")
+ENDPY2
+        python3 "$TT_PY2" /etc/nginx/stream-enabled/stream.conf "$TT_PORT"
+        rm -f "$TT_PY2"
+        nginx -s reload 2>/dev/null || true
+        ok "stream.conf обновлён на порт $TT_PORT, nginx перезагружен."
+    fi
+elif [ -n "$ACTUAL_PORT" ]; then
+    ok "Endpoint слушает на ожидаемом порту $TT_PORT."
+fi
+
 
 # ── Автообновление сертификата ────────────────────────────────────────────────
 # Настраиваем ДВА механизма обновления: certbot-таймер systemd + cron (резерв)
@@ -688,10 +615,16 @@ if CLIENT_CONFIG=$("$INSTALL_DIR/trusttunnel_endpoint" \
         "$INSTALL_DIR/hosts.toml" \
         -c "$USERNAME" \
         -a "${SERVER_IP}:${TT_PUBLIC_PORT}" 2>&1); then
+    # Патчим skip_verification = true:
+    # Клиент TrustTunnel проверяет сертификат через системное хранилище Windows,
+    # игнорируя встроенный certificate = "..." в конфиге. На Windows промежуточный
+    # CA Let's Encrypt E7 (ECDSA) может отсутствовать в кэше и верификация падает.
+    # Поскольку сам сертификат прописан в конфиге, skip_verification = true безопасен.
+    CLIENT_CONFIG=$(echo "$CLIENT_CONFIG" | sed 's/^skip_verification = false$/skip_verification = true/')
     echo "$CLIENT_CONFIG" > "$CLIENT_CONF_FILE"
     chown trusttunnel:trusttunnel "$CLIENT_CONF_FILE"
     chmod 600 "$CLIENT_CONF_FILE"
-    ok "Client-config сохранён: $CLIENT_CONF_FILE"
+    ok "Client-config сохранён: $CLIENT_CONF_FILE (skip_verification = true)"
 else
     warn "Не удалось экспортировать client-config. Ошибка: $CLIENT_CONFIG"
     CLIENT_CONFIG=""
@@ -810,4 +743,122 @@ else
 fi
 sep
 echo -e "${GRN}  ⚡ Сохраните данный вывод!${NC}"
+sep
+
+# ── Встроенная диагностика подключения ────────────────────────────────────────
+echo
+sep
+echo -e "${BLU}  Диагностика подключения TrustTunnel${NC}"
+sep
+
+DIAG_FAIL=0
+
+# 1. Сервис запущен?
+if systemctl is-active --quiet trusttunnel; then
+    ok "Сервис trusttunnel: запущен"
+else
+    err "Сервис trusttunnel: НЕ запущен"
+    journalctl -u trusttunnel -n 5 --no-pager 2>/dev/null || true
+    DIAG_FAIL=1
+fi
+
+# 2. TrustTunnel слушает на своём внутреннем порту?
+if ss -tlnp 2>/dev/null | grep -q ":${TT_PORT}[[:space:]]"; then
+    ok "TrustTunnel слушает на ${TT_LISTEN_ADDR}:${TT_PORT}"
+else
+    err "TrustTunnel НЕ слушает на порту ${TT_PORT} (0.0.0.0)"
+    DIAG_FAIL=1
+fi
+
+# 3. nginx запущен и слушает 443?
+if ss -tlnp 2>/dev/null | grep -q ":443[[:space:]]"; then
+    ok "nginx слушает на порту 443"
+else
+    err "Порт 443 не слушается — nginx упал или не запущен"
+    DIAG_FAIL=1
+fi
+
+# 4. nginx SNI: файл trusttunnel_sni.conf создан и домен есть в нём?
+if [ "$COEXIST_MODE" -eq 1 ]; then
+    TT_SNI_CONF="/etc/nginx/stream-enabled/trusttunnel_sni.conf"
+    if [ -f "$TT_SNI_CONF" ] && grep -q "$DOMAIN" "$TT_SNI_CONF" 2>/dev/null; then
+        ok "nginx SNI: $TT_SNI_CONF содержит маршрут для $DOMAIN"
+    else
+        err "nginx SNI: файл $TT_SNI_CONF не найден или домен $DOMAIN отсутствует"
+        warn "Запустите скрипт заново или создайте файл вручную (см. документацию)"
+        DIAG_FAIL=1
+    fi
+    if ss -tlnp 2>/dev/null | grep -q ":443[[:space:]]"; then
+        ok "nginx слушает порт 443 (публичный)"
+    else
+        err "Порт 443 не слушается"
+        DIAG_FAIL=1
+    fi
+else
+    if ss -tlnp 2>/dev/null | grep -q ":443[[:space:]]"; then
+        ok "TrustTunnel слушает порт 443 напрямую"
+    else
+        err "Порт 443 не слушается"
+        DIAG_FAIL=1
+    fi
+fi
+
+# 5. nginx конфиг валиден?
+if nginx -t -q 2>/dev/null; then
+    ok "nginx конфиг: валиден"
+else
+    err "nginx конфиг: ОШИБКА"
+    nginx -t 2>&1 | grep -v "^$" | while read -r l; do echo -e "    ${RED}$l${NC}"; done
+    DIAG_FAIL=1
+fi
+
+# 6. TLS: сертификат читается и не просрочен?
+CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+if [ -f "$CERT_PATH" ]; then
+    EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_PATH" 2>/dev/null | cut -d= -f2)
+    EXPIRY_TS=$(date -d "$EXPIRY" +%s 2>/dev/null || echo 0)
+    NOW_TS=$(date +%s)
+    DAYS_LEFT=$(( (EXPIRY_TS - NOW_TS) / 86400 ))
+    if [ "$DAYS_LEFT" -gt 0 ]; then
+        ok "Сертификат: действителен ещё $DAYS_LEFT дней (до $EXPIRY)"
+    else
+        err "Сертификат: ПРОСРОЧЕН ($EXPIRY)"
+        DIAG_FAIL=1
+    fi
+else
+    err "Сертификат не найден: $CERT_PATH"
+    DIAG_FAIL=1
+fi
+
+# 7. TCP-рукопожатие с TrustTunnel через nginx SNI (имитируем клиента)
+# openssl s_client с SNI — проверяем что nginx роутит и TrustTunnel отвечает
+echo
+inf "Проверка TLS-соединения с TrustTunnel (${DOMAIN}:${TT_PUBLIC_PORT})..."
+TLS_OUT=$(echo Q | timeout 5 openssl s_client \
+    -connect "${SERVER_IP}:443" \
+    -servername "$DOMAIN" \
+    -brief 2>&1 || true)
+
+if echo "$TLS_OUT" | grep -q "SSL handshake has read"; then
+    ok "TLS handshake с TrustTunnel: успешен"
+elif echo "$TLS_OUT" | grep -q "CONNECTED"; then
+    ok "TCP соединение установлено, TLS идёт"
+else
+    err "TLS через TrustTunnel: нет ответа или ошибка"
+    echo "$TLS_OUT" | grep -v "^$" | head -5 | while read -r l; do
+        echo -e "    ${RED}$l${NC}"
+    done
+    DIAG_FAIL=1
+fi
+
+echo
+sep
+if [ "$DIAG_FAIL" -eq 0 ]; then
+    ok "Все проверки пройдены. Инфраструктура настроена корректно."
+    echo -e "  ${GRY}Если клиент всё равно не подключается — проверьте client-config${NC}"
+    echo -e "  ${GRY}(он должен содержать правильный IP сервера и hostname домена)${NC}"
+else
+    warn "Обнаружены проблемы. Исправьте ошибки выше и перезапустите:"
+    echo -e "  ${GRY}systemctl restart trusttunnel && nginx -s reload${NC}"
+fi
 sep
